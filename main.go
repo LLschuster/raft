@@ -18,6 +18,8 @@ const (
 	CANDIDATE
 )
 
+const serverAddress = "localhost"
+
 type CMDpeerIds struct {
 	ids *[]uint
 }
@@ -52,26 +54,23 @@ type Server struct {
 	quit chan any
 }
 
-// The type we are gonna register for the RPC communication
-// That means all functions declared here will be available for other servers to call.
-type RpcProxy struct {
-	server *Server
+func (s *Server) Info() {
+	stateString := func() string {
+		switch s.state {
+		case LEADER:
+			return "Leader"
+		case FOLLOWER:
+			return "Follower"
+		case CANDIDATE:
+			return "Candidate"
+		default:
+			return "wtf state"
+		}
+	}()
+	fmt.Printf("serverId: %d has state: %s", s.serverId, stateString)
 }
 
-type Args struct {
-	ok uint
-}
-
-type Reply struct {
-	message string
-}
-
-func (rpc *RpcProxy) Quit(args *Args, reply *Reply) error {
-	close(rpc.server.quit)
-	return nil
-}
-
-func NewServerAndListen(serverId uint, peerIds []uint, port int) *Server {
+func NewServerAndListen(serverId uint, peerIds []uint, port int) *RpcProxy {
 	server := new(Server)
 	rpcProxy := new(RpcProxy)
 	server.peerIds = peerIds
@@ -81,6 +80,7 @@ func NewServerAndListen(serverId uint, peerIds []uint, port int) *Server {
 	server.quit = make(chan any)
 	server.mapPeerClients = make(map[uint]*rpc.Client)
 
+	rpcProxy.server = server
 	server.rpc.RegisterName("RaftConsensus", rpcProxy)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -91,17 +91,33 @@ func NewServerAndListen(serverId uint, peerIds []uint, port int) *Server {
 
 	fmt.Printf("Listening on address %s \n", listener.Addr())
 
-	go http.Serve(listener, nil)
+	go http.Serve(listener, server.rpc)
 
 	for _, peerId := range peerIds {
-		client, err := rpc.DialHTTP("tcp", fmt.Sprintf(":%d", peerId))
+		client, err := rpc.DialHTTP("tcp", fmt.Sprintf("%s:%d", serverAddress, peerId))
 		if err != nil {
-			fmt.Printf("Cannot dial to server %d -> %v", peerId, err)
+			fmt.Printf("Cannot dial to server %d -> %v\n", peerId, err)
+			continue
 		}
 		server.mapPeerClients[peerId] = client
 	}
 
-	return server
+	rpcProxy.BecomeAFollower()
+
+	return rpcProxy
+}
+
+func (s *Server) GetPeerClient(peerId uint) *rpc.Client {
+	if client, ok := s.mapPeerClients[peerId]; ok {
+		return client
+	}
+	client, err := rpc.DialHTTP("tcp", fmt.Sprintf("%s:%d", serverAddress, peerId))
+	if err != nil {
+		fmt.Printf("Cannot dial to server %d -> %v\n", peerId, err)
+		return nil
+	}
+	s.mapPeerClients[peerId] = client
+	return client
 }
 
 func main() {
@@ -114,13 +130,16 @@ func main() {
 
 	fmt.Println("start of Raft program")
 	fmt.Printf("cmdPeerIds.ids %v\n", *cmdPeerIds.ids)
-	s := NewServerAndListen(1, *cmdPeerIds.ids, *port)
+	rpcProxy := NewServerAndListen(1, *cmdPeerIds.ids, *port)
 
-	fmt.Printf("%v", s.peerIds)
+	if os.Getenv("isLeader") == "1" {
+		rpcProxy.BecomeALeader()
+	}
 
+	rpcProxy.server.Info()
 	for {
 		select {
-		case <-s.quit:
+		case <-rpcProxy.server.quit:
 			return
 		default:
 			// TODO

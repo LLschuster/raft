@@ -1,7 +1,7 @@
 # Raft Algorithm
 
 ## Implementation
-
+```
 Start every server as a follower
 all servers should have an id and a map to all other peers in the network
 servers have a state, which could be leader, follower, candidate
@@ -17,3 +17,12 @@ tasks divided by state
     Candidate:
         while on the election process it will vote and request votes.
         if it wins the selection it becomes the leader, follower otherwise.
+    
+    ElectionDetails:
+
+        startElection
+            increase current term
+            change server state to candidate
+            votes for itself
+            request other server votes, if votes > n / 2 + 1
+```
