@@ -130,7 +130,7 @@ func main() {
 
 	fmt.Println("start of Raft program")
 	fmt.Printf("cmdPeerIds.ids %v\n", *cmdPeerIds.ids)
-	rpcProxy := NewServerAndListen(1, *cmdPeerIds.ids, *port)
+	rpcProxy := NewServerAndListen(uint(*port), *cmdPeerIds.ids, *port)
 
 	if os.Getenv("isLeader") == "1" {
 		rpcProxy.BecomeALeader()

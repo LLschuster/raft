@@ -26,3 +26,10 @@ tasks divided by state
             votes for itself
             request other server votes, if votes > n / 2 + 1
 ```
+
+## Running the servers
+
+```bash
+isLeader=1 go run main.go raft.go  -port 6969 -peerIds 6970
+go run main.go raft.go  -port 6970 -peerIds 6969
+```
