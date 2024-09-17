@@ -67,7 +67,7 @@ func (s *Server) Info() {
 			return "wtf state"
 		}
 	}()
-	fmt.Printf("serverId: %d has state: %s", s.serverId, stateString)
+	fmt.Printf("serverId: %d has state: %s\n", s.serverId, stateString)
 }
 
 func NewServerAndListen(serverId uint, peerIds []uint, port int) *RpcProxy {
@@ -121,6 +121,11 @@ func (s *Server) GetPeerClient(peerId uint) *rpc.Client {
 }
 
 func main() {
+	if os.Getenv("test") == "1" {
+		test()
+		return
+	}
+
 	port := flag.Int("port", 6969, "example: -port 6969")
 	var ids = make([]uint, 0, 10)
 	cmdPeerIds := CMDpeerIds{&ids}

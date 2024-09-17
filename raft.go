@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +20,8 @@ const (
 // The type we are gonna register for the RPC communication
 // That means all functions declared here will be available for other servers to call.
 type RpcProxy struct {
+	logEntries             []LogEntry
+	logFile                string
 	server                 *Server
 	timeSinceLastHeartbeat time.Time
 	term                   uint
@@ -35,12 +40,29 @@ type Reply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term uint
+	Term         uint
+	prevLogIndex uint
+	logEntries   []LogEntry
 }
 
 type RequestVotesArgs struct {
 	Term    uint
 	voteFor uint
+}
+
+type StoreKeyArgs struct {
+	Key   string
+	Value any
+}
+
+type LogEntry struct {
+	Term  uint
+	Index uint
+	Data  any
+}
+
+func (logEntry *LogEntry) toString() string {
+	return fmt.Sprintf("%d %d %v", logEntry.Term, logEntry.Index, logEntry.Data)
 }
 
 func (rpc *RpcProxy) Quit(args *Args, reply *Reply) error {
@@ -89,6 +111,37 @@ func (rpc *RpcProxy) AppendEntries(args *AppendEntriesArgs, reply *Reply) error 
 	rpc.timeSinceLastHeartbeat = time.Now()
 	reply.Term = rpc.term
 
+	lastOwnEntry := rpc.logEntries[len(rpc.logEntries)-1]
+	if lastOwnEntry.Term > args.logEntries[0].Term {
+		reply.Message = "Term is outdated"
+		return nil
+	}
+
+	if lastOwnEntry.Index > args.prevLogIndex {
+		reply.Message = "The logEntry index is outdated"
+		return nil
+	} else if lastOwnEntry.Index < args.prevLogIndex {
+		reply.Message = "My log has a hole, i need more entries"
+		return nil
+	}
+
+	reply.Message = "acknowledge"
+	rpc.logEntries = append(rpc.logEntries, args.logEntries...)
+	file, err := os.OpenFile(rpc.logFile, os.O_APPEND, os.ModeAppend)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	fileWriter := bufio.NewWriter(file)
+	finalEntriesString := ""
+	for _, entry := range args.logEntries {
+		finalEntriesString += entry.toString()
+	}
+	_, err = fileWriter.WriteString(finalEntriesString)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -119,6 +172,8 @@ func (rpc *RpcProxy) StartElections() {
 
 	rpc.mu.Lock()
 
+	timeOut := time.NewTimer((150 * time.Millisecond) + (time.Duration(rand.Intn(100)) * time.Millisecond))
+	defer timeOut.Stop()
 	newTerm := rpc.term + 1
 	serverId := rpc.server.serverId
 	votesRequired := uint(len(rpc.server.peerIds)/2) + 1
@@ -170,6 +225,11 @@ func (rpc *RpcProxy) StartElections() {
 		}()
 	}
 
+	<-timeOut.C
+	// the current election timeout without a winner, become a follower to start nextElection
+	if rpc.server.state == CANDIDATE {
+		rpc.BecomeAFollower()
+	}
 }
 
 func (rpc *RpcProxy) RunElectionTimeout() {
@@ -185,7 +245,7 @@ func (rpc *RpcProxy) RunElectionTimeout() {
 		rpc.mu.Unlock()
 
 		elapsedTime := time.Since(timeSinceLastHeartbeat)
-		if elapsedTime > time.Millisecond*500 {
+		if elapsedTime > time.Millisecond*750 {
 			// fmt.Printf("elapsed time %v since heartbeat \n", elapsedTime)
 			rpc.StartElections()
 		}
@@ -202,16 +262,18 @@ func (rpc *RpcProxy) SendHeartbeats() {
 
 	currentTerm := rpc.term
 	rpc.mu.Unlock()
-	timeTicker := time.NewTicker(time.Millisecond * 75)
+	timeTicker := time.NewTicker(time.Millisecond * 175)
 	defer timeTicker.Stop()
 
 	for {
 		<-timeTicker.C
 
 		// Added instability
-		rndNumber := rand.Intn(10)
-		if rndNumber > 8 {
-			time.Sleep(time.Millisecond * 1200)
+		if false {
+			rndNumber := rand.Intn(10)
+			if rndNumber > 8 {
+				time.Sleep(time.Millisecond * 1200)
+			}
 		}
 
 		//
@@ -238,4 +300,75 @@ func (rpc *RpcProxy) SendHeartbeats() {
 		}
 
 	}
+}
+
+func (rpc *RpcProxy) StoreKey(args *StoreKeyArgs, reply *Reply) error {
+	if rpc.server.state != LEADER {
+		reply.Message = "I am not the leader server"
+		return nil
+	}
+
+	newLogEntry := LogEntry{}
+	keyvalue := make(map[string]any)
+	keyvalue[args.Key] = args.Value
+
+	rpc.mu.Lock()
+	newLogEntry.Data = keyvalue
+	newLogEntry.Term = rpc.term
+	newLogEntry.Index = uint(len(rpc.logEntries))
+	rpc.mu.Unlock()
+
+	var acknowledgeCount struct {
+		count uint
+		mu    sync.Mutex
+	}
+	acknowledgeCount.count = 1
+
+	peersCount := len(rpc.server.peerIds)
+	acknowledgeGroup := sync.WaitGroup{}
+	acknowledgeGroup.Add(peersCount)
+
+	for peerId := range rpc.server.peerIds {
+		go func() {
+			defer acknowledgeGroup.Done()
+			client := rpc.server.GetPeerClient(uint(peerId))
+			if client == nil {
+				return
+			}
+			args := AppendEntriesArgs{}
+			reply := Reply{}
+			err := client.Call("RaftConsensus.AppendEntries", &args, &reply)
+			if err != nil {
+				fmt.Printf("ERROR appending entries %v\n", err)
+				return
+			}
+			if !strings.Contains(reply.Message, "acknowledge") {
+				return
+			}
+
+			acknowledgeCount.mu.Lock()
+			acknowledgeCount.count += 1
+			acknowledgeCount.mu.Unlock()
+		}()
+	}
+
+	acknowledgeGroup.Wait()
+	if acknowledgeCount.count < (uint(peersCount)/2)+1 {
+		return errors.New("Could not process request, must peers are down")
+	}
+
+	rpc.mu.Lock()
+	rpc.logEntries = append(rpc.logEntries, newLogEntry)
+
+	file, error := os.OpenFile(rpc.logFile, os.O_APPEND, os.ModeAppend)
+	if error != nil {
+		return error
+	}
+	defer file.Close()
+
+	fileWriter := bufio.NewWriter(file)
+	fileWriter.WriteString(newLogEntry.toString())
+	rpc.mu.Unlock()
+
+	return nil
 }

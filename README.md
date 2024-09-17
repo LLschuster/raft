@@ -30,6 +30,6 @@ tasks divided by state
 ## Running the servers
 
 ```bash
-isLeader=1 go run main.go raft.go  -port 6969 -peerIds 6970
-go run main.go raft.go  -port 6970 -peerIds 6969
+isLeader=1 go run main.go raft.go test.go  -port 6969 -peerIds 6970
+go run main.go raft.go test.go -port 6970 -peerIds 6969
 ```
