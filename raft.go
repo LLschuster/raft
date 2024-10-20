@@ -12,9 +12,11 @@ import (
 )
 
 const (
-	VOTEDGRANTED = "granted"
-	VOTEDDENIED  = "denied"
-	TERMOUTDATED = "outdated"
+	VOTEDGRANTED              = "granted"
+	VOTEDDENIED               = "denied"
+	TERMOUTDATED              = "outdated"
+	LOG_FILE_ACCESS_FLAGS     = os.O_APPEND | os.O_WRONLY
+	LOG_FILE_PERMISSION_FLAGS = os.ModeAppend | os.ModePerm
 )
 
 // The type we are gonna register for the RPC communication
@@ -41,8 +43,8 @@ type Reply struct {
 
 type AppendEntriesArgs struct {
 	Term         uint
-	prevLogIndex uint
-	logEntries   []LogEntry
+	PrevLogIndex uint
+	LogEntries   []LogEntry
 }
 
 type RequestVotesArgs struct {
@@ -62,7 +64,7 @@ type LogEntry struct {
 }
 
 func (logEntry *LogEntry) toString() string {
-	return fmt.Sprintf("%d %d %v", logEntry.Term, logEntry.Index, logEntry.Data)
+	return fmt.Sprintf("%d %d %v\n", logEntry.Term, logEntry.Index, logEntry.Data)
 }
 
 func (rpc *RpcProxy) Quit(args *Args, reply *Reply) error {
@@ -102,42 +104,53 @@ func (rpc *RpcProxy) BecomeAFollower() {
 	go rpc.RunElectionTimeout()
 }
 
-func (rpc *RpcProxy) AppendEntries(args *AppendEntriesArgs, reply *Reply) error {
+func (rpc *RpcProxy) AppendEntries(args AppendEntriesArgs, reply *Reply) error {
 	rpc.mu.Lock()
 	defer rpc.mu.Unlock()
 
-	fmt.Printf("AppendEntries %v \n", args)
+	fmt.Printf("AppendEntries %+v \n", args)
 
 	rpc.timeSinceLastHeartbeat = time.Now()
 	reply.Term = rpc.term
 
-	lastOwnEntry := rpc.logEntries[len(rpc.logEntries)-1]
-	if lastOwnEntry.Term > args.logEntries[0].Term {
-		reply.Message = "Term is outdated"
+	if len(args.LogEntries) <= 0 {
 		return nil
 	}
 
-	if lastOwnEntry.Index > args.prevLogIndex {
-		reply.Message = "The logEntry index is outdated"
-		return nil
-	} else if lastOwnEntry.Index < args.prevLogIndex {
-		reply.Message = "My log has a hole, i need more entries"
-		return nil
+	if len(rpc.logEntries) > 0 {
+		lastOwnEntry := rpc.logEntries[len(rpc.logEntries)-1]
+		if lastOwnEntry.Term > args.LogEntries[len(args.LogEntries)-1].Term {
+			reply.Message = "Term is outdated"
+			return nil
+		}
+
+		if lastOwnEntry.Index > args.PrevLogIndex {
+			reply.Message = "The logEntry index is outdated"
+			return nil
+		} else if lastOwnEntry.Index < args.PrevLogIndex {
+			reply.Message = fmt.Sprintf(
+				"My log has a hole, i need more entries my index %d, leader index %d\n", lastOwnEntry.Index, args.PrevLogIndex)
+			return nil
+		}
 	}
 
 	reply.Message = "acknowledge"
-	rpc.logEntries = append(rpc.logEntries, args.logEntries...)
-	file, err := os.OpenFile(rpc.logFile, os.O_APPEND, os.ModeAppend)
+	rpc.logEntries = append(rpc.logEntries, args.LogEntries...)
+	file, err := os.OpenFile(rpc.logFile, LOG_FILE_ACCESS_FLAGS, LOG_FILE_PERMISSION_FLAGS)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 	fileWriter := bufio.NewWriter(file)
 	finalEntriesString := ""
-	for _, entry := range args.logEntries {
+	for _, entry := range args.LogEntries {
 		finalEntriesString += entry.toString()
 	}
 	_, err = fileWriter.WriteString(finalEntriesString)
+	if err != nil {
+		return err
+	}
+	err = fileWriter.Flush()
 	if err != nil {
 		return err
 	}
@@ -252,6 +265,15 @@ func (rpc *RpcProxy) RunElectionTimeout() {
 	}
 }
 
+// getPreviousLogIndex requires a lock
+func (rpc *RpcProxy) getPreviousLogIndex() uint {
+	var prevLogIndex uint = 0
+	if len(rpc.logEntries) > 0 {
+		prevLogIndex = rpc.logEntries[len(rpc.logEntries)-1].Index
+	}
+	return prevLogIndex
+}
+
 func (rpc *RpcProxy) SendHeartbeats() {
 	rpc.mu.Lock()
 
@@ -278,15 +300,18 @@ func (rpc *RpcProxy) SendHeartbeats() {
 
 		//
 		for _, peerId := range rpc.server.peerIds {
+			prevLogIndex := rpc.getPreviousLogIndex()
 			args := AppendEntriesArgs{
-				Term: currentTerm,
+				Term:         currentTerm,
+				PrevLogIndex: prevLogIndex,
+				LogEntries:   rpc.logEntries,
 			}
 			reply := Reply{}
 			client := rpc.server.GetPeerClient(peerId)
 			if client == nil {
 				continue
 			}
-			err := client.Call("RaftConsensus.AppendEntries", &args, &reply)
+			err := client.Call("RaftConsensus.AppendEntries", args, &reply)
 			if err != nil {
 				fmt.Printf("could not call AppendEntries on peer %d -> %v\n", peerId, err)
 			}
@@ -309,13 +334,19 @@ func (rpc *RpcProxy) StoreKey(args *StoreKeyArgs, reply *Reply) error {
 	}
 
 	newLogEntry := LogEntry{}
-	keyvalue := make(map[string]any)
-	keyvalue[args.Key] = args.Value
+	// keyvalue := make(map[string]any)
+	// keyvalue[args.Key] = args.Value
+	keyvalue := fmt.Sprintf("%s->%v", args.Key, args.Value)
 
 	rpc.mu.Lock()
+	var prevLogIndex uint = rpc.getPreviousLogIndex()
+
 	newLogEntry.Data = keyvalue
 	newLogEntry.Term = rpc.term
-	newLogEntry.Index = uint(len(rpc.logEntries))
+	newLogEntry.Index = prevLogIndex + 1
+	rpc.logEntries = append(rpc.logEntries, newLogEntry)
+	logEntries := rpc.logEntries
+
 	rpc.mu.Unlock()
 
 	var acknowledgeCount struct {
@@ -328,21 +359,27 @@ func (rpc *RpcProxy) StoreKey(args *StoreKeyArgs, reply *Reply) error {
 	acknowledgeGroup := sync.WaitGroup{}
 	acknowledgeGroup.Add(peersCount)
 
-	for peerId := range rpc.server.peerIds {
+	for _, peerId := range rpc.server.peerIds {
 		go func() {
 			defer acknowledgeGroup.Done()
-			client := rpc.server.GetPeerClient(uint(peerId))
+			client := rpc.server.GetPeerClient(peerId)
 			if client == nil {
 				return
 			}
-			args := AppendEntriesArgs{}
+			args := AppendEntriesArgs{
+				Term:         newLogEntry.Term,
+				PrevLogIndex: prevLogIndex,
+				LogEntries:   logEntries,
+			}
 			reply := Reply{}
-			err := client.Call("RaftConsensus.AppendEntries", &args, &reply)
+			fmt.Printf("calling store key to %d with args %+v \n", peerId, args)
+			err := client.Call("RaftConsensus.AppendEntries", args, &reply)
 			if err != nil {
 				fmt.Printf("ERROR appending entries %v\n", err)
 				return
 			}
 			if !strings.Contains(reply.Message, "acknowledge") {
+				fmt.Printf("ERROR appending entries, no acknowledge %v\n", reply)
 				return
 			}
 
@@ -354,13 +391,13 @@ func (rpc *RpcProxy) StoreKey(args *StoreKeyArgs, reply *Reply) error {
 
 	acknowledgeGroup.Wait()
 	if acknowledgeCount.count < (uint(peersCount)/2)+1 {
-		return errors.New("Could not process request, must peers are down")
+		return errors.New("could not process request, must peers are down")
 	}
 
 	rpc.mu.Lock()
 	rpc.logEntries = append(rpc.logEntries, newLogEntry)
 
-	file, error := os.OpenFile(rpc.logFile, os.O_APPEND, os.ModeAppend)
+	file, error := os.OpenFile(rpc.logFile, LOG_FILE_ACCESS_FLAGS, LOG_FILE_PERMISSION_FLAGS)
 	if error != nil {
 		return error
 	}

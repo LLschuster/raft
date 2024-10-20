@@ -81,6 +81,7 @@ func NewServerAndListen(serverId uint, peerIds []uint, port int) *RpcProxy {
 	server.mapPeerClients = make(map[uint]*rpc.Client)
 
 	rpcProxy.server = server
+	rpcProxy.logFile = fmt.Sprintf("logfile-%d.txt", serverId)
 	server.rpc.RegisterName("RaftConsensus", rpcProxy)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -123,6 +124,11 @@ func (s *Server) GetPeerClient(peerId uint) *rpc.Client {
 func main() {
 	if os.Getenv("test") == "1" {
 		test()
+		return
+	}
+
+	if os.Getenv("client") == "1" {
+		client()
 		return
 	}
 
